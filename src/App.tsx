@@ -9,6 +9,7 @@ import { useTranslation } from 'react-i18next';
 import { useDispatch, useSelector } from 'react-redux';
 import { z } from 'zod';
 import { addField, addRule, publishVersion, reorderFields, selectPreview, useSchemaHistoryQuery, type FormField, type RootState } from './store';
+import MergePanel from './MergePanel';
 
 const runtimeSchema = z.object({
   name: z.string().min(2, '请输入申请名称'),
@@ -53,10 +54,23 @@ export default function App() {
     const missing = active.fields.filter((field) => field.required && !snapshot.data[field.id]).map((field) => field.label);
     setMigration(missing.length ? `旧数据缺少新版本必填字段：${missing.join('、')}。迁移时需要补充或使用默认值。` : '旧数据可以直接迁移到当前版本。');
   }
+  function fieldLabel(id: string): string {
+    const found = active.fields.find((field) => field.id === id);
+    if (found) return found.label;
+    for (const merge of state.merges) {
+      const hit = [...merge.sourceFields, merge.targetField].find((field) => field.id === id);
+      if (hit) return hit.label;
+    }
+    return id;
+  }
+  function migrationFor(snapshotId: string) {
+    return state.merges.flatMap((merge) => merge.snapshotMigrations).find((migration) => migration.snapshotId === snapshotId);
+  }
 
   return (
     <Box minHeight="100vh" bgcolor="#f7f8fc">
       <AppBar position="sticky" color="primary"><Toolbar><Typography variant="h6" flexGrow={1}>{t('title')}</Typography><Button color="inherit" onClick={() => dispatch(publishVersion())}>{t('publish')}</Button></Toolbar></AppBar>
+      {state.publishBlocked && <Alert severity="error" sx={{ mx: 3, mt: 2 }}>{state.publishBlocked}</Alert>}
       <Container maxWidth="xl" sx={{ py: 4 }}>
         <Grid container spacing={3}>
           <Grid size={{ xs: 12, lg: 7 }}>
@@ -68,13 +82,14 @@ export default function App() {
               {[...active.rules, ...state.rules].map((rule) => <Alert key={rule.id} severity="info" sx={{ mb: 1 }}>{rule.fieldId} {rule.operator === 'equals' ? '等于' : '非空'} {rule.value || ''} 时，{rule.effect === 'require' ? '要求' : '显示'} {rule.targetId}</Alert>)}
               <Stack direction="row" spacing={2} mt={2}><FormControl size="small" fullWidth><InputLabel>目标字段</InputLabel><Select label="目标字段" value={newRuleTarget} onChange={(event) => setNewRuleTarget(event.target.value)}>{active.fields.map((field) => <MenuItem key={field.id} value={field.id}>{field.label}</MenuItem>)}</Select></FormControl><Button variant="outlined" onClick={() => dispatch(addRule({ fieldId: 'department', operator: 'equals', value: '财务', effect: 'require', targetId: newRuleTarget }))}>添加财务联动</Button></Stack>
             </CardContent></Card>
+            <Box mt={3}><MergePanel /></Box>
           </Grid>
 
           <Grid size={{ xs: 12, lg: 5 }}>
             <Card><CardContent>
               <Tabs value={tab} onChange={(_, value) => setTab(value)}><Tab label="版本差异" /><Tab label={t('simulate')} /><Tab label={t('runtime')} /></Tabs>
-              {tab === 0 && <Box mt={2}><Typography fontWeight={700} mb={1}>v1 → {active.label}</Typography><Stack direction="row" gap={1} flexWrap="wrap">{active.fields.map((field) => <Chip key={field.id} label={`新增 ${field.label}`} color="success" variant="outlined" />)}</Stack><Alert severity="warning" sx={{ mt: 2 }}>旧版本解释保持冻结；过去提交的数据不会按新字段含义重新解释。</Alert><Typography mt={2} fontWeight={700}>其他历史版本</Typography>{history.map((version) => <Button key={version.id} fullWidth sx={{ justifyContent: 'space-between' }} onClick={() => dispatch(selectPreview(version.id))}>{version.label}<span>{version.createdAt}</span></Button>)}</Box>}
-              {tab === 1 && <Box mt={2}><Typography fontWeight={700} mb={1}>选择旧数据快照</Typography>{snapshots.map((snapshot) => <Card key={snapshot.id} variant="outlined" sx={{ p: 2, mb: 1 }}><Typography>{snapshot.label}</Typography><Typography variant="body2" color="text.secondary" mb={1}>{JSON.stringify(snapshot.data)}</Typography><Button size="small" onClick={() => simulate(snapshot.id)}>模拟迁移</Button></Card>)}{migration && <Alert severity={migration.includes('缺少') ? 'warning' : 'success'}>{migration}</Alert>}</Box>}
+              {tab === 0 && <Box mt={2}><Typography fontWeight={700} mb={1}>v1 → {active.label}</Typography><Stack direction="row" gap={1} flexWrap="wrap">{active.fields.map((field) => <Chip key={field.id} label={`新增 ${field.label}`} color="success" variant="outlined" />)}</Stack><Alert severity="warning" sx={{ mt: 2 }}>旧版本解释保持冻结；过去提交的数据不会按新字段含义重新解释。</Alert>{state.merges.filter((merge) => merge.versionId === active.id).map((merge) => <Alert key={merge.id} severity="info" sx={{ mt: 2 }}>已合并字段：{merge.sourceFields.map((field) => field.label).join(' + ')} → {merge.targetField.label}（{merge.createdAt}）。联动规则已统一指向新字段；旧快照仍按合并前字段解释。</Alert>)}<Typography mt={2} fontWeight={700}>其他历史版本</Typography>{history.map((version) => <Button key={version.id} fullWidth sx={{ justifyContent: 'space-between' }} onClick={() => dispatch(selectPreview(version.id))}>{version.label}<span>{version.createdAt}</span></Button>)}</Box>}
+              {tab === 1 && <Box mt={2}><Typography fontWeight={700} mb={1}>选择旧数据快照</Typography>{snapshots.map((snapshot) => { const migrated = migrationFor(snapshot.id); return <Card key={snapshot.id} variant="outlined" sx={{ p: 2, mb: 1 }}><Typography>{snapshot.label}</Typography><Typography variant="body2" color="text.secondary" mb={1}>{JSON.stringify(snapshot.data)}</Typography>{migrated && <Box mt={1}><Typography variant="caption" color="text.secondary">迁移到新版本（有值优先，空值不覆盖；来源已保留）：</Typography><Stack direction="row" gap={0.5} flexWrap="wrap" mt={0.5}>{Object.entries(migrated.values).map(([key, value]) => <Chip key={key} label={`${fieldLabel(key)}: ${value}`} size="small" />)}</Stack>{migrated.pending.map((item) => <Alert key={item.targetFieldId} severity="warning" sx={{ mt: 1 }}>待选（两边值不同，已保留来源）：{item.sources.map((source) => `${fieldLabel(source.fieldId)} ${source.value}`).join(' / ')}{item.chosenFieldId ? ` → 已选 ${fieldLabel(item.chosenFieldId)}` : ''}</Alert>)}</Box>}<Button size="small" sx={{ mt: 1 }} onClick={() => simulate(snapshot.id)}>模拟迁移</Button></Card>; })}{migration && <Alert severity={migration.includes('缺少') ? 'warning' : 'success'}>{migration}</Alert>}</Box>}
               {tab === 2 && <Box component="form" mt={2} onSubmit={form.handleSubmit((values) => setRuntimeResult(values))}><Stack spacing={2}>{active.fields.map((field) => <TextField key={field.id} label={field.label} type={field.type === 'number' ? 'number' : 'text'} required={field.required} {...form.register(field.id as keyof z.infer<typeof runtimeSchema>, field.type === 'number' ? { valueAsNumber: true } : {})} error={Boolean(form.formState.errors[field.id as keyof typeof form.formState.errors])} helperText={form.formState.errors[field.id as keyof typeof form.formState.errors]?.message} />)}<Button type="submit" variant="contained">按当前版本提交</Button></Stack>{runtimeResult && <Alert severity="success" sx={{ mt: 2 }}>运行态数据：{JSON.stringify(runtimeResult)}</Alert>}<Alert severity="info" sx={{ mt: 2 }}>历史数据按创建时版本解释，不随字段新增而改变。</Alert></Box>}
             </CardContent></Card>
           </Grid>
