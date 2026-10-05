@@ -8,7 +8,8 @@ import { useForm } from 'react-hook-form';
 import { useTranslation } from 'react-i18next';
 import { useDispatch, useSelector } from 'react-redux';
 import { z } from 'zod';
-import { addField, addRule, publishVersion, reorderFields, selectPreview, useSchemaHistoryQuery, type FormField, type RootState } from './store';
+import MergePanel from './MergePanel';
+import { addField, addRule, publishVersion, reorderFields, resolvePendingValue, selectPreview, useSchemaHistoryQuery, type FormField, type RootState } from './store';
 
 const runtimeSchema = z.object({
   name: z.string().min(2, '请输入申请名称'),
@@ -46,17 +47,33 @@ export default function App() {
   const { data: history = [] } = useSchemaHistoryQuery(active.id);
   const form = useForm<z.infer<typeof runtimeSchema>>({ resolver: zodResolver(runtimeSchema), defaultValues: { name: '', department: '', amount: 0, budgetCode: '', invoiceDate: '' } });
 
+  const unresolvedConflicts = state.mergePlan?.conflicts.filter((conflict) => !state.mergePlan?.resolutions[conflict.id]).length ?? 0;
+  const publishBlockReason = state.mergePlan
+    ? unresolvedConflicts > 0 ? `${unresolvedConflicts} 个规则冲突未处理` : '合并方案未提交'
+    : null;
+  const fieldLabel = (id: string) => active.fields.find((field) => field.id === id)?.label ?? id;
+
   function dragEnd(event: DragEndEvent) { if (event.over && event.active.id !== event.over.id) dispatch(reorderFields({ activeId: String(event.active.id), overId: String(event.over.id) })); }
   function simulate(snapshotId: string) {
     const snapshot = snapshots.find((item) => item.id === snapshotId);
     if (!snapshot) return;
     const missing = active.fields.filter((field) => field.required && !snapshot.data[field.id]).map((field) => field.label);
-    setMigration(missing.length ? `旧数据缺少新版本必填字段：${missing.join('、')}。迁移时需要补充或使用默认值。` : '旧数据可以直接迁移到当前版本。');
+    const pendingCount = Object.keys(snapshot.pending ?? {}).length;
+    const parts = [missing.length ? `旧数据缺少新版本必填字段：${missing.join('、')}。迁移时需要补充或使用默认值。` : '旧数据可以直接迁移到当前版本。'];
+    if (pendingCount > 0) parts.push(`另有 ${pendingCount} 个合并字段处于「待选」，请先在快照卡片上选择取值。`);
+    setMigration(parts.join(' '));
   }
 
   return (
     <Box minHeight="100vh" bgcolor="#f7f8fc">
-      <AppBar position="sticky" color="primary"><Toolbar><Typography variant="h6" flexGrow={1}>{t('title')}</Typography><Button color="inherit" onClick={() => dispatch(publishVersion())}>{t('publish')}</Button></Toolbar></AppBar>
+      <AppBar position="sticky" color="primary">
+        <Toolbar>
+          <Typography variant="h6" flexGrow={1}>{t('title')}</Typography>
+          {publishBlockReason && <Typography variant="body2" sx={{ mr: 2 }}>发布已锁定：{publishBlockReason}</Typography>}
+          <Button color="inherit" disabled={Boolean(publishBlockReason)} onClick={() => dispatch(publishVersion())}>{t('publish')}</Button>
+        </Toolbar>
+      </AppBar>
+      {state.publishError && <Container maxWidth="xl" sx={{ pt: 2 }}><Alert severity="error">{state.publishError}</Alert></Container>}
       <Container maxWidth="xl" sx={{ py: 4 }}>
         <Grid container spacing={3}>
           <Grid size={{ xs: 12, lg: 7 }}>
@@ -74,9 +91,27 @@ export default function App() {
             <Card><CardContent>
               <Tabs value={tab} onChange={(_, value) => setTab(value)}><Tab label="版本差异" /><Tab label={t('simulate')} /><Tab label={t('runtime')} /></Tabs>
               {tab === 0 && <Box mt={2}><Typography fontWeight={700} mb={1}>v1 → {active.label}</Typography><Stack direction="row" gap={1} flexWrap="wrap">{active.fields.map((field) => <Chip key={field.id} label={`新增 ${field.label}`} color="success" variant="outlined" />)}</Stack><Alert severity="warning" sx={{ mt: 2 }}>旧版本解释保持冻结；过去提交的数据不会按新字段含义重新解释。</Alert><Typography mt={2} fontWeight={700}>其他历史版本</Typography>{history.map((version) => <Button key={version.id} fullWidth sx={{ justifyContent: 'space-between' }} onClick={() => dispatch(selectPreview(version.id))}>{version.label}<span>{version.createdAt}</span></Button>)}</Box>}
-              {tab === 1 && <Box mt={2}><Typography fontWeight={700} mb={1}>选择旧数据快照</Typography>{snapshots.map((snapshot) => <Card key={snapshot.id} variant="outlined" sx={{ p: 2, mb: 1 }}><Typography>{snapshot.label}</Typography><Typography variant="body2" color="text.secondary" mb={1}>{JSON.stringify(snapshot.data)}</Typography><Button size="small" onClick={() => simulate(snapshot.id)}>模拟迁移</Button></Card>)}{migration && <Alert severity={migration.includes('缺少') ? 'warning' : 'success'}>{migration}</Alert>}</Box>}
+              {tab === 1 && <Box mt={2}><Typography fontWeight={700} mb={1}>选择旧数据快照</Typography>{snapshots.map((snapshot) => <Card key={snapshot.id} variant="outlined" sx={{ p: 2, mb: 1 }}>
+                <Stack direction="row" spacing={1} alignItems="center"><Typography>{snapshot.label}</Typography>{snapshot.migratedFrom && <Chip size="small" color="info" variant="outlined" label="迁移副本" />}</Stack>
+                <Typography variant="body2" color="text.secondary" mb={1}>{JSON.stringify(snapshot.data)}</Typography>
+                {snapshot.pending && Object.entries(snapshot.pending).map(([fieldId, pending]) => (
+                  <Alert key={fieldId} severity="warning" sx={{ mb: 1 }}>
+                    「{fieldLabel(fieldId)}」待选（来源已保留）：
+                    {pending.sources.map((source) => (
+                      <Button key={source.fieldId} size="small" sx={{ ml: 1 }} onClick={() => dispatch(resolvePendingValue({ snapshotId: snapshot.id, fieldId, value: source.value }))}>
+                        采用{source.label}「{source.value}」
+                      </Button>
+                    ))}
+                  </Alert>
+                ))}
+                <Button size="small" onClick={() => simulate(snapshot.id)}>模拟迁移</Button>
+              </Card>)}{migration && <Alert severity={migration.includes('缺少') || migration.includes('待选') ? 'warning' : 'success'}>{migration}</Alert>}</Box>}
               {tab === 2 && <Box component="form" mt={2} onSubmit={form.handleSubmit((values) => setRuntimeResult(values))}><Stack spacing={2}>{active.fields.map((field) => <TextField key={field.id} label={field.label} type={field.type === 'number' ? 'number' : 'text'} required={field.required} {...form.register(field.id as keyof z.infer<typeof runtimeSchema>, field.type === 'number' ? { valueAsNumber: true } : {})} error={Boolean(form.formState.errors[field.id as keyof typeof form.formState.errors])} helperText={form.formState.errors[field.id as keyof typeof form.formState.errors]?.message} />)}<Button type="submit" variant="contained">按当前版本提交</Button></Stack>{runtimeResult && <Alert severity="success" sx={{ mt: 2 }}>运行态数据：{JSON.stringify(runtimeResult)}</Alert>}<Alert severity="info" sx={{ mt: 2 }}>历史数据按创建时版本解释，不随字段新增而改变。</Alert></Box>}
             </CardContent></Card>
+          </Grid>
+
+          <Grid size={{ xs: 12 }}>
+            <Card><CardContent><MergePanel /></CardContent></Card>
           </Grid>
         </Grid>
       </Container>
